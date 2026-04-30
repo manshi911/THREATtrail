@@ -1,0 +1,2349 @@
+"""
+PhishGuard GUI Application
+
+This module provides a graphical user interface for the PhishGuard email threat detection system.
+"""
+
+import os
+import sys
+import logging
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QPushButton, QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
+    QSplitter, QFrame, QStyleFactory, QMessageBox, QProgressBar, 
+    QCheckBox, QComboBox, QGroupBox, QFormLayout, QLineEdit, QTextEdit,
+    QFileDialog, QSizePolicy, QToolButton, QStatusBar, QAction, QHeaderView,
+    QGraphicsOpacityEffect, QSlider, QDialog
+)
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer, QUrl, QPropertyAnimation, QEasingCurve
+from PyQt5.QtGui import QIcon, QPixmap, QFont, QDesktopServices, QColor, QPalette
+
+# Make sure modules from src can be imported
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
+
+# Try to import the logo creator module
+try:
+    from create_logo import create_logo
+except ImportError:
+    def create_logo():
+        return None
+
+# Try to import UI resources
+try:
+    from ui_resources import get_icon, get_pixmap, ANIMATIONS
+    from color_scheme import COLORS, TEXT_COLORS, STATUS_COLORS, RISK_COLORS
+except ImportError:
+    def get_icon(icon_name, size=None):
+        return QIcon()
+    def get_pixmap(icon_name, size=None):
+        return QPixmap()
+    ANIMATIONS = {}
+    # Define fallback colors
+    COLORS = {
+        'primary': '#4361ee', 'secondary': '#3f37c9', 'success': '#4cc9f0',
+        'warning': '#f0a935', 'danger': '#e63946', 'light': '#f8f9fa',
+        'dark': '#212529', 'white': '#ffffff', 'black': '#000000',
+        'bg_primary': '#f0f4ff', 'bg_secondary': '#e9ecef', 'bg_dark': '#343a40'
+    }
+    TEXT_COLORS = {'title': COLORS['dark'], 'body': COLORS['dark']}
+    STATUS_COLORS = {'active': COLORS['success'], 'inactive': COLORS['danger']}
+    RISK_COLORS = {'high': COLORS['danger'], 'medium': COLORS['warning'], 'low': COLORS['primary']}
+
+# Import PhishGuard modules
+from src.email_integration.gmail_monitor import GmailMonitor
+from src.threat_detection.threat_detector import ThreatDetector
+from src.warning_system.alert_dialog import PhishingAlert
+from src.data_logging.data_logger import DataLogger
+from src.reporting.report_generator import ReportGenerator
+from src.ocr_processing.ocr_processor import OCRProcessor
+
+# Configure logging
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(Path("logs/phishguard_gui.log")),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('phishguard_gui')
+
+# Global style constants
+COLORS = {
+    'primary': '#0066cc',
+    'secondary': '#5c9aff',
+    'success': '#28a745',
+    'warning': '#ffc107',
+    'danger': '#dc3545',
+    'light': '#f8f9fa',
+    'dark': '#343a40',
+    'bg_primary': '#f0f4f8',
+    'bg_secondary': '#ffffff',
+    'text_primary': '#333333',
+    'text_secondary': '#666666'
+}
+
+# Email monitoring worker thread
+class EmailMonitoringThread(QThread):
+    email_received = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+    status_update = pyqtSignal(str)
+    
+    def __init__(self, gmail_monitor, threat_detector, parent=None):
+        super().__init__(parent)
+        self.gmail_monitor = gmail_monitor
+        self.threat_detector = threat_detector
+        self.running = False
+    
+    def run(self):
+        self.running = True
+        self.status_update.emit("Connecting to Gmail...")
+        
+        try:
+            if self.gmail_monitor.connect():
+                self.status_update.emit("Connected to Gmail IMAP server.")
+                
+                while self.running:
+                    try:
+                        emails = self.gmail_monitor.fetch_unread_emails()
+                        
+                        for email_data in emails:
+                            self.status_update.emit(f"Analyzing email: {email_data['subject']}")
+                            
+                            # Analyze email for threats
+                            is_suspicious, risk_score, threat_type, indicators = self.threat_detector.analyze(email_data)
+                            
+                            # Add analysis results to email data
+                            email_data['is_suspicious'] = is_suspicious
+                            email_data['risk_score'] = risk_score
+                            email_data['threat_type'] = threat_type
+                            email_data['indicators'] = indicators
+                            
+                            # Emit signal with email data
+                            self.email_received.emit(email_data)
+                        
+                        # Sleep for the check interval
+                        time.sleep(10)  # Check every 10 seconds
+                        
+                    except Exception as e:
+                        self.error_occurred.emit(f"Error processing emails: {str(e)}")
+                        time.sleep(30)  # Longer delay after error
+            else:
+                self.error_occurred.emit("Failed to connect to Gmail IMAP server.")
+        
+        except Exception as e:
+            self.error_occurred.emit(f"Error in email monitoring thread: {str(e)}")
+    
+    def stop(self):
+        self.running = False
+        if self.gmail_monitor:
+            self.gmail_monitor.disconnect()
+
+class PhishGuardGUI(QMainWindow):
+    """Main window for the PhishGuard GUI application."""
+    def __init__(self):
+        """Initialize the PhishGuard GUI application."""
+        super().__init__()
+        
+        # --- Initialize instance variables ---
+        self.monitoring_thread = None
+        self.data_logger = None
+        self.report_generator = None
+        self.warning_system = None
+        self.thread_running = False
+        self.last_update_time = datetime.now()
+        
+        # Form elements for reports tab
+        self.report_type_combo = None
+        self.time_period_combo = None 
+        self.dept_filter = None
+        self.format_combo = None
+        
+        self.setWindowTitle("PhishGuard - Email Threat Protection")
+        self.setMinimumSize(1000, 700)
+        
+        # Create logo if it doesn't exist
+        self.logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phishguard_logo.png")
+        if not os.path.exists(self.logo_path):
+            try:
+                self.logo_path = create_logo()
+            except Exception as e:
+                logger.error(f"Error creating logo: {str(e)}")
+                self.logo_path = None
+        
+        # Set window icon if logo exists
+        if self.logo_path and os.path.exists(self.logo_path):
+            self.setWindowIcon(QIcon(self.logo_path))
+        
+        # Initialize components
+        self.initializeComponents()
+          # Set up the user interface
+        self.setupUI()
+        
+        # Connect signals and slots
+        self.connectSignals()
+        
+        # Start timer for updating stats
+        self.statsTimer = QTimer(self)
+        self.statsTimer.timeout.connect(self.updateStatistics)
+        self.statsTimer.start(60000)  # Update every minute
+        
+        # Initial statistics update
+        self.updateStatistics()
+        
+    def initializeComponents(self):
+        """Initialize the PhishGuard components."""        
+        try:
+            self.threat_detector = ThreatDetector()
+            self.gmail_monitor = GmailMonitor()
+            self.warning_system = PhishingAlert()
+            self.data_logger = DataLogger()
+            self.report_generator = ReportGenerator(self.data_logger)
+            self.ocr_processor = OCRProcessor()
+            
+            self.email_thread = None
+            self.monitoring_active = False
+            
+        except Exception as e:
+            logger.error(f"Error initializing components: {str(e)}")
+            QMessageBox.critical(self, "Initialization Error", 
+                                "Failed to initialize PhishGuard components: " + str(e))
+    
+    def setupUI(self):
+        """Set up the user interface."""
+        # Set application style
+        QApplication.setStyle(QStyleFactory.create("Fusion"))
+        
+        # Apply custom stylesheet
+        self.applyTheme()
+        
+        # Main widget and layout
+        main_widget = QWidget()
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        self.setCentralWidget(main_widget)
+        
+        # Create header
+        self.createHeader(main_layout)
+        
+        # Create main content area
+        self.createMainContent(main_layout)
+        
+        # Create status bar
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.statusBar.showMessage("PhishGuard ready")
+    
+    def applyTheme(self):
+        """Apply the custom theme stylesheet."""
+        try:
+            # Find the QSS file path
+            qss_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "theme.qss")
+            
+            if os.path.exists(qss_path):
+                # Read the stylesheet
+                with open(qss_path, "r") as f:
+                    stylesheet = f.read()
+                
+                # Apply the stylesheet
+                self.setStyleSheet(stylesheet)
+                logger.info("Applied custom theme stylesheet")
+            else:
+                logger.warning(f"Theme file not found at {qss_path}")
+        except Exception as e:
+            logger.error(f"Error applying theme: {str(e)}")
+    def createHeader(self, parent_layout):
+        """Create the application header."""
+        header_frame = QFrame()
+        header_frame.setObjectName("header_frame")  # Set object name for styling in QSS
+        header_frame.setStyleSheet(f"background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {COLORS['primary']}, stop:1 #004080); color: white;")
+        header_frame.setMinimumHeight(80)
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(20, 10, 20, 10)
+        
+        # Logo and title with animation
+        logo_label = QLabel()
+        if self.logo_path and os.path.exists(self.logo_path):
+            logo_pixmap = QPixmap(self.logo_path).scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(logo_pixmap)
+        else:
+            # Use a default icon if logo not available
+            logo_label.setPixmap(get_pixmap("email", (60, 60)))
+        
+        title_label = QLabel("PhishGuard")
+        title_label.setFont(QFont("Segoe UI", 20, QFont.Bold))
+        title_label.setStyleSheet("color: white;")
+        
+        subtitle_label = QLabel("Email Threat Protection System")
+        subtitle_label.setFont(QFont("Segoe UI", 10))
+        subtitle_label.setStyleSheet("color: rgba(255, 255, 255, 0.8);")
+        
+        # Apply fade-in animation to header elements
+        self.animate_widget(logo_label)
+        self.animate_widget(title_label)
+        self.animate_widget(subtitle_label, delay=200)
+        
+        title_layout = QVBoxLayout()
+        title_layout.addWidget(title_label)
+        title_layout.addWidget(subtitle_label)
+        
+        logo_title_layout = QHBoxLayout()
+        logo_title_layout.addWidget(logo_label)
+        logo_title_layout.addLayout(title_layout)
+        logo_title_layout.addStretch()
+        
+        # Monitoring status with animated indicator
+        status_layout = QHBoxLayout()
+        
+        # Status indicator (circle)
+        self.status_indicator = QLabel()
+        self.status_indicator.setFixedSize(12, 12)
+        self.status_indicator.setStyleSheet("background-color: #666; border-radius: 6px;")
+        
+        # Status text
+        self.monitoring_status = QLabel("Monitoring: Inactive")
+        self.monitoring_status.setStyleSheet("color: rgba(255, 255, 255, 0.8);")
+        self.monitoring_status.setFont(QFont("Segoe UI", 10))
+        
+        status_layout.addWidget(self.status_indicator)
+        status_layout.addWidget(self.monitoring_status)
+        
+        # Control buttons with icons
+        self.start_button = QPushButton("Start Monitoring")
+        self.start_button.setObjectName("start_button")  # For QSS styling
+        self.start_button.setIcon(get_icon("start"))
+        self.start_button.setIconSize(QSize(16, 16))
+        self.start_button.setMinimumWidth(150)
+        self.start_button.setCursor(Qt.PointingHandCursor)
+        
+        self.stop_button = QPushButton("Stop Monitoring")
+        self.stop_button.setObjectName("stop_button")  # For QSS styling
+        self.stop_button.setIcon(get_icon("stop"))
+        self.stop_button.setIconSize(QSize(16, 16))
+        self.stop_button.setMinimumWidth(150)
+        self.stop_button.setCursor(Qt.PointingHandCursor)
+        self.stop_button.setEnabled(False)
+        
+        # Add widgets to header layout
+        header_layout.addLayout(logo_title_layout)
+        header_layout.addStretch()
+        header_layout.addLayout(status_layout)
+        header_layout.addSpacing(20)
+        header_layout.addWidget(self.start_button)
+        header_layout.addWidget(self.stop_button)
+        
+        parent_layout.addWidget(header_frame)
+    
+    def animate_widget(self, widget, duration=800, delay=0):
+        """Apply fade-in animation to a widget."""
+        # Create opacity effect
+        opacity_effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(opacity_effect)
+        
+        # Create animation
+        self.anim = QPropertyAnimation(opacity_effect, b"opacity")
+        self.anim.setDuration(duration)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.setEasingCurve(QEasingCurve.InOutQuad)        # Start animation with delay
+        if delay > 0:
+            QTimer.singleShot(delay, self.anim.start)
+        else:
+            self.anim.start()
+    
+    def createMainContent(self, parent_layout):
+        """Create the main content area with tabs."""
+        # Create tab widget
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)  # More modern look
+        self.tabs.setObjectName("main_tabs")
+        
+        # Create dashboard tab with icon
+        dashboard_widget = QWidget()
+        self.createDashboardTab(dashboard_widget)
+        self.tabs.addTab(dashboard_widget, get_icon("chart"), "Dashboard")
+        
+        # Create threats tab with icon
+        threats_widget = QWidget()
+        self.createThreatsTab(threats_widget)
+        self.tabs.addTab(threats_widget, get_icon("risk_high"), "Threats")
+        
+        # Create reports tab with icon
+        reports_widget = QWidget()
+        self.createReportsTab(reports_widget)
+        self.tabs.addTab(reports_widget, get_icon("report"), "Reports")
+        
+        # Create settings tab with icon
+        settings_widget = QWidget()
+        self.createSettingsTab(settings_widget)
+        self.tabs.addTab(settings_widget, get_icon("settings"), "Settings")
+        
+        # Add the tab widget to the main layout
+        parent_layout.addWidget(self.tabs)
+    def createDashboardTab(self, parent_widget):
+        """Create the dashboard tab."""
+        dashboard_layout = QVBoxLayout(parent_widget)
+        dashboard_layout.setContentsMargins(15, 15, 15, 15)
+        dashboard_layout.setSpacing(15)
+        
+        # Quick status panel with gradient
+        status_panel = QFrame()
+        status_panel.setStyleSheet(
+            "QFrame {background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0066cc, stop:1 #5c9aff); "
+            "border-radius: 8px; color: white; padding: 10px;}"
+        )
+        status_panel.setMinimumHeight(100)
+        status_panel_layout = QHBoxLayout(status_panel)
+        
+        # Current status info
+        status_info = QLabel("System Status: Active and Monitoring")
+        status_info.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        status_info.setStyleSheet("color: white;")
+        
+        # Last checked time
+        self.last_checked_label = QLabel("Last Check: Just now")
+        self.last_checked_label.setStyleSheet("color: rgba(255, 255, 255, 0.8);")
+        
+        # Add widgets to status panel
+        status_info_layout = QVBoxLayout()
+        status_info_layout.addWidget(status_info)
+        status_info_layout.addWidget(self.last_checked_label)
+        
+        # Add a refresh button
+        refresh_button = QPushButton("Refresh")
+        refresh_button.setIcon(get_icon("refresh"))
+        refresh_button.setStyleSheet(
+            "QPushButton {background-color: rgba(255, 255, 255, 0.2); color: white; border: none; "
+            "border-radius: 4px; padding: 8px 16px;} "
+            "QPushButton:hover {background-color: rgba(255, 255, 255, 0.3);}"
+        )
+        refresh_button.setCursor(Qt.PointingHandCursor)
+        refresh_button.clicked.connect(self.updateStatistics)
+        
+        status_panel_layout.addLayout(status_info_layout)
+        status_panel_layout.addStretch()
+        status_panel_layout.addWidget(refresh_button)
+        
+        # Add status panel to dashboard
+        dashboard_layout.addWidget(status_panel)
+        
+        # Statistics section
+        stats_group = QGroupBox("Threat Statistics")
+        stats_group.setObjectName("stats_group")
+        stats_layout = QHBoxLayout(stats_group)
+        stats_layout.setSpacing(15)
+        
+        # Create stat widgets with icons and animations
+        self.createStatWidget(stats_layout, "Total Threats", "0", COLORS['danger'], "risk_high")
+        self.createStatWidget(stats_layout, "Today's Threats", "0", COLORS['warning'], "risk_medium")
+        self.createStatWidget(stats_layout, "Average Risk Score", "0%", COLORS['primary'], "chart")
+        self.createStatWidget(stats_layout, "Emails Monitored", "0", COLORS['success'], "email")
+        
+        # Recent threats table
+        threats_group = QGroupBox("Recent Threats")
+        threats_group.setObjectName("threats_group")
+        threats_layout = QVBoxLayout(threats_group)
+        
+        self.recent_threats_table = QTableWidget()
+        self.recent_threats_table.setColumnCount(5)
+        self.recent_threats_table.setHorizontalHeaderLabels(["Time", "Sender", "Subject", "Risk Score", "Threat Type"])
+        self.recent_threats_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)  # Make Subject column stretch
+        self.recent_threats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Time column
+        self.recent_threats_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.recent_threats_table.setAlternatingRowColors(True)
+        self.recent_threats_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.recent_threats_table.verticalHeader().setVisible(False)  # Hide row numbers
+        
+        threats_layout.addWidget(self.recent_threats_table)
+        
+        # Department summary
+        dept_group = QGroupBox("Department Risk Overview")
+        dept_group.setObjectName("dept_group")
+        dept_layout = QVBoxLayout(dept_group)
+        
+        self.dept_table = QTableWidget()
+        self.dept_table.setColumnCount(4)
+        self.dept_table.setHorizontalHeaderLabels(["Department", "Threat Count", "Avg Risk Score", "Most Common Threat"])
+        self.dept_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)  # Department column
+        self.dept_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.dept_table.setAlternatingRowColors(True)
+        self.dept_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.dept_table.verticalHeader().setVisible(False)  # Hide row numbers
+        
+        dept_layout.addWidget(self.dept_table)
+        
+        # Create a splitter for the two table sections
+        tables_splitter = QSplitter(Qt.Vertical)
+        tables_splitter.addWidget(threats_group)
+        tables_splitter.addWidget(dept_group)
+        tables_splitter.setSizes([600, 400])  # Set relative sizes (threats table larger)        # Add widgets to dashboard layout
+        dashboard_layout.addWidget(stats_group)
+        dashboard_layout.addWidget(tables_splitter)
+        
+    def createStatWidget(self, parent_layout, title, value, color, icon_name=None):
+        """Create a statistics widget."""
+        stat_frame = QFrame()
+        stat_frame.setObjectName("stat_widget")  # For QSS styling
+        stat_frame.setFrameShape(QFrame.StyledPanel)
+        stat_frame.setStyleSheet(f"background-color: white; border-radius: 8px; border-top: 4px solid {color}; border: 1px solid #e0e0e0;")
+        stat_layout = QVBoxLayout(stat_frame)
+        stat_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Header layout with icon and title
+        header_layout = QHBoxLayout()
+        
+        # Add icon if provided
+        if icon_name:
+            icon_label = QLabel()
+            icon_label.setPixmap(get_pixmap(icon_name, (16, 16)))
+            header_layout.addWidget(icon_label)
+        
+        # Title label
+        title_label = QLabel(title)
+        title_label.setObjectName("stat_title")  # For QSS styling
+        title_label.setAlignment(Qt.AlignLeft)
+        title_label.setFont(QFont("Segoe UI", 10))
+        title_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-weight: bold;")
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        
+        # Value label with animation preparation
+        value_label = QLabel(value)
+        value_label.setObjectName("stat_value")  # For QSS styling
+        value_label.setAlignment(Qt.AlignCenter)
+        value_label.setFont(QFont("Segoe UI", 24, QFont.Bold))
+        value_label.setStyleSheet(f"color: {color};")
+        
+        # Store reference to value label
+        setattr(self, f"{title.lower().replace(' ', '_').replace('\'', '')}_label", value_label)
+        
+        # Add widgets to stat layout
+        stat_layout.addLayout(header_layout)
+        stat_layout.addWidget(value_label, 1, Qt.AlignCenter)
+        
+        # Add to parent layout
+        parent_layout.addWidget(stat_frame)
+    def populateExampleData(self):
+        """Populate the dashboard with example data."""
+        # Add example data to the recent threats table
+        self.recent_threats_table.setRowCount(5)
+        
+        # Example threat 1 - High risk
+        self.recent_threats_table.setItem(0, 0, QTableWidgetItem("10:30 AM"))
+        self.recent_threats_table.setItem(0, 1, QTableWidgetItem("suspicious@example.com"))
+        self.recent_threats_table.setItem(0, 2, QTableWidgetItem("Urgent: Your account has been compromised"))
+        risk_score_item = QTableWidgetItem("85%")
+        risk_score_item.setForeground(QColor(COLORS['danger']))
+        self.recent_threats_table.setItem(0, 3, risk_score_item)
+        self.recent_threats_table.setItem(0, 4, QTableWidgetItem("Phishing"))
+        
+        # Example threat 2 - Medium risk
+        self.recent_threats_table.setItem(1, 0, QTableWidgetItem("09:45 AM"))
+        self.recent_threats_table.setItem(1, 1, QTableWidgetItem("newsletter@unknown-domain.com"))
+        self.recent_threats_table.setItem(1, 2, QTableWidgetItem("Important Document Attached"))
+        risk_score_item = QTableWidgetItem("65%")
+        risk_score_item.setForeground(QColor(COLORS['warning']))
+        self.recent_threats_table.setItem(1, 3, risk_score_item)
+        self.recent_threats_table.setItem(1, 4, QTableWidgetItem("Suspicious Attachment"))
+        
+        # Example threat 3 - Low risk
+        self.recent_threats_table.setItem(2, 0, QTableWidgetItem("Yesterday"))
+        self.recent_threats_table.setItem(2, 1, QTableWidgetItem("info@company-portal.net"))
+        self.recent_threats_table.setItem(2, 2, QTableWidgetItem("Update your password now"))
+        risk_score_item = QTableWidgetItem("40%")
+        risk_score_item.setForeground(QColor(COLORS['primary']))
+        self.recent_threats_table.setItem(2, 3, risk_score_item)
+        self.recent_threats_table.setItem(2, 4, QTableWidgetItem("Social Engineering"))
+        
+        # Example threat 4 - High risk
+        self.recent_threats_table.setItem(3, 0, QTableWidgetItem("Yesterday"))
+        self.recent_threats_table.setItem(3, 1, QTableWidgetItem("paypal-security@mail.tk"))
+        self.recent_threats_table.setItem(3, 2, QTableWidgetItem("Your payment was processed"))
+        risk_score_item = QTableWidgetItem("90%")
+        risk_score_item.setForeground(QColor(COLORS['danger']))
+        self.recent_threats_table.setItem(3, 3, risk_score_item)
+        self.recent_threats_table.setItem(3, 4, QTableWidgetItem("Phishing"))
+        
+        # Example threat 5 - Medium risk
+        self.recent_threats_table.setItem(4, 0, QTableWidgetItem("2 days ago"))
+        self.recent_threats_table.setItem(4, 1, QTableWidgetItem("hr-notification@domain.co"))
+        self.recent_threats_table.setItem(4, 2, QTableWidgetItem("Salary Adjustment Document"))
+        risk_score_item = QTableWidgetItem("55%")
+        risk_score_item.setForeground(QColor(COLORS['warning']))
+        self.recent_threats_table.setItem(4, 3, risk_score_item)
+        self.recent_threats_table.setItem(4, 4, QTableWidgetItem("Suspicious Link"))
+        
+        # Add example data to the department table
+        self.dept_table.setRowCount(4)
+        
+        # Example department 1
+        self.dept_table.setItem(0, 0, QTableWidgetItem("Finance"))
+        self.dept_table.setItem(0, 1, QTableWidgetItem("12"))
+        risk_score_item = QTableWidgetItem("78%")
+        risk_score_item.setForeground(QColor(COLORS['danger']))
+        self.dept_table.setItem(0, 2, risk_score_item)
+        self.dept_table.setItem(0, 3, QTableWidgetItem("Phishing"))
+        
+        # Example department 2
+        self.dept_table.setItem(1, 0, QTableWidgetItem("Human Resources"))
+        self.dept_table.setItem(1, 1, QTableWidgetItem("8"))
+        risk_score_item = QTableWidgetItem("62%")
+        risk_score_item.setForeground(QColor(COLORS['warning']))
+        self.dept_table.setItem(1, 2, risk_score_item)
+        self.dept_table.setItem(1, 3, QTableWidgetItem("Social Engineering"))
+        
+        # Example department 3
+        self.dept_table.setItem(2, 0, QTableWidgetItem("IT"))
+        self.dept_table.setItem(2, 1, QTableWidgetItem("4"))
+        risk_score_item = QTableWidgetItem("45%")
+        risk_score_item.setForeground(QColor(COLORS['primary']))
+        self.dept_table.setItem(2, 2, risk_score_item)
+        self.dept_table.setItem(2, 3, QTableWidgetItem("Malware"))
+        
+        # Example department 4
+        self.dept_table.setItem(3, 0, QTableWidgetItem("Marketing"))
+        self.dept_table.setItem(3, 1, QTableWidgetItem("7"))
+        risk_score_item = QTableWidgetItem("58%")
+        risk_score_item.setForeground(QColor(COLORS['warning']))
+        self.dept_table.setItem(3, 2, risk_score_item)
+        self.dept_table.setItem(3, 3, QTableWidgetItem("Suspicious Links"))
+        
+        # Update time
+        self.last_checked_label.setText(f"Last Check: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        
+        # Set example statistics with animated effect
+        QTimer.singleShot(300, lambda: self.animateStatisticValue("total_threats_label", "27"))
+        QTimer.singleShot(500, lambda: self.animateStatisticValue("todays_threats_label", "5"))
+        QTimer.singleShot(700, lambda: self.animateStatisticValue("average_risk_score_label", "67%"))
+        QTimer.singleShot(900, lambda: self.animateStatisticValue("emails_monitored_label", "142"))
+    
+    def animateStatisticValue(self, widget_name, target_value):
+        """Animate a statistic value change."""
+        if hasattr(self, widget_name):
+            widget = getattr(self, widget_name)
+            # Handle percentage values
+            if "%" in target_value:
+                target_num = int(target_value.replace("%", ""))
+                is_percent = True
+            else:
+                target_num = int(target_value)
+                is_percent = False
+            
+            # Start from zero for a smoother effect
+            current_num = 0
+            
+            # Create animation steps
+            steps = 20
+            increment = target_num / steps
+            
+            # Animation function
+            def update_value():
+                nonlocal current_num
+                current_num += increment
+                if current_num >= target_num:
+                    current_num = target_num
+                    timer.stop()
+                
+                # Update the label
+                if is_percent:
+                    widget.setText(f"{int(current_num)}%")
+                else:
+                    widget.setText(str(int(current_num)))
+            
+            # Create a timer for animation
+            timer = QTimer(self)
+            timer.timeout.connect(update_value)
+            timer.start(50)  # Update every 50ms
+    
+    def createThreatsTab(self, parent_widget):
+        """Create the threats tab."""
+        threats_layout = QVBoxLayout(parent_widget)
+        threats_layout.setContentsMargins(15, 15, 15, 15)
+        threats_layout.setSpacing(15)
+        
+        # Filters section
+        filters_frame = QFrame()
+        filters_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 10px;")
+        filters_layout = QHBoxLayout(filters_frame)
+        
+        # Time filter
+        time_filter_layout = QVBoxLayout()
+        time_filter_layout.addWidget(QLabel("Time Period:"))
+        time_filter = QComboBox()
+        time_filter.addItems(["All Time", "Today", "Last 7 Days", "Last 30 Days"])
+        time_filter.setCurrentIndex(1)  # Default to Today
+        time_filter_layout.addWidget(time_filter)
+        
+        # Department filter
+        dept_filter_layout = QVBoxLayout()
+        dept_filter_layout.addWidget(QLabel("Department:"))
+        dept_filter = QComboBox()
+        dept_filter.addItems(["All Departments", "Finance", "Human Resources", "IT", "Marketing"])
+        dept_filter_layout.addWidget(dept_filter)
+        
+        # Risk level filter
+        risk_filter_layout = QVBoxLayout()
+        risk_filter_layout.addWidget(QLabel("Risk Level:"))
+        risk_filter = QComboBox()
+        risk_filter.addItems(["All Risk Levels", "High Risk", "Medium Risk", "Low Risk"])
+        risk_filter_layout.addWidget(risk_filter)
+        
+        # Threat type filter
+        threat_filter_layout = QVBoxLayout()
+        threat_filter_layout.addWidget(QLabel("Threat Type:"))
+        threat_filter = QComboBox()
+        threat_filter.addItems(["All Threats", "Phishing", "Malware", "Social Engineering", "Suspicious Links"])
+        threat_filter_layout.addWidget(threat_filter)
+        
+        # Refresh button
+        refresh_layout = QVBoxLayout()
+        refresh_layout.addWidget(QLabel(" "))  # Empty label for alignment
+        refresh_button = QPushButton("Apply Filters")
+        refresh_button.setIcon(get_icon("refresh"))
+        refresh_button.setObjectName("refresh_button")  # For QSS styling
+        refresh_button.setCursor(Qt.PointingHandCursor)
+        refresh_layout.addWidget(refresh_button)
+        
+        # Add widgets to filters layout
+        filters_layout.addLayout(time_filter_layout)
+        filters_layout.addLayout(dept_filter_layout)
+        filters_layout.addLayout(risk_filter_layout)
+        filters_layout.addLayout(threat_filter_layout)
+        filters_layout.addLayout(refresh_layout)
+        
+        # Add filters frame to main layout
+        threats_layout.addWidget(filters_frame)
+        
+        # Create threats table
+        threats_table_frame = QFrame()
+        threats_table_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 10px;")
+        threats_table_layout = QVBoxLayout(threats_table_frame)
+        
+        # Table header with title and count
+        table_header_layout = QHBoxLayout()
+        table_title = QLabel("Detected Threats")
+        table_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        threats_count = QLabel("Total: 27 threats detected")
+        
+        table_header_layout.addWidget(table_title)
+        table_header_layout.addStretch()
+        table_header_layout.addWidget(threats_count)
+        
+        # Create detailed threats table
+        self.threats_table = QTableWidget()
+        self.threats_table.setColumnCount(7)
+        self.threats_table.setHorizontalHeaderLabels([
+            "Date/Time", "Sender", "Recipient", "Subject", "Risk Level", "Threat Type", "Status"
+        ])
+        
+        # Configure table appearance
+        self.threats_table.setAlternatingRowColors(True)
+        self.threats_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.threats_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.threats_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)  # Subject column stretch
+        self.threats_table.verticalHeader().setVisible(False)  # Hide row numbers
+        
+        # Add header and table to layout
+        threats_table_layout.addLayout(table_header_layout)
+        threats_table_layout.addWidget(self.threats_table)
+        
+        # Action buttons
+        actions_layout = QHBoxLayout()
+        
+        view_button = QPushButton("View Details")
+        view_button.setIcon(get_icon("chart"))
+        view_button.setCursor(Qt.PointingHandCursor)
+        
+        export_button = QPushButton("Export Data")
+        export_button.setIcon(get_icon("report"))
+        export_button.setCursor(Qt.PointingHandCursor)
+        
+        actions_layout.addStretch()
+        actions_layout.addWidget(view_button)
+        actions_layout.addWidget(export_button)
+          # Add threats table to main layout
+        threats_layout.addWidget(threats_table_frame)
+        
+        # Populate with sample data
+        self.populateThreatsList()
+          def createReportsTab(self, parent_widget):
+        """Create the reports tab."""
+        reports_layout = QVBoxLayout(parent_widget)
+        reports_layout.setContentsMargins(15, 15, 15, 15)
+        reports_layout.setSpacing(15)
+        
+        # Header with gradient
+        header_frame = QFrame()
+        header_frame.setStyleSheet(
+            "QFrame {background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #5c9aff, stop:1 #8cb8ff); "
+            "border-radius: 8px; color: white; padding: 15px;}"
+        )
+        header_frame.setMinimumHeight(120)
+        header_layout = QVBoxLayout(header_frame)
+        
+        header_title = QLabel("Threat Reports")
+        header_title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        header_title.setStyleSheet("color: white;")
+        
+        header_subtitle = QLabel(
+            "Generate detailed reports on email threats, analyze trends, and export data for further analysis."
+        )
+        header_subtitle.setStyleSheet("color: rgba(255, 255, 255, 0.8);")
+        header_subtitle.setWordWrap(True)
+        
+        header_layout.addWidget(header_title)
+        header_layout.addWidget(header_subtitle)
+        
+        # Report generation section
+        report_frame = QFrame()
+        report_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 20px; border: 1px solid #cccccc;")
+        report_frame.setMinimumHeight(400)  # Ensure minimum height for content
+        report_layout = QVBoxLayout(report_frame)
+        report_layout.setSpacing(15)
+        
+        # Title
+        report_title = QLabel("Generate New Report")
+        report_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        report_title.setStyleSheet("color: #0066cc; margin-bottom: 10px;")
+        report_layout.addWidget(report_title)
+        
+        # Description
+        report_description = QLabel("Select report options below and click 'Preview Report' to see a sample or 'Generate Report' to create the full report.")
+        report_description.setWordWrap(True)
+        report_description.setStyleSheet("color: #666; margin-bottom: 15px;")
+        report_layout.addWidget(report_description)
+        
+        # Form layout for report options
+        form_layout = QFormLayout()
+        form_layout.setSpacing(20)
+        form_layout.setContentsMargins(20, 20, 20, 20)
+        form_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form_layout.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        
+        # Report type combo
+        report_type_label = QLabel("Report Type:")
+        report_type_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        report_type_label.setStyleSheet("color: #0066cc; background: transparent; margin-right: 10px;")
+        
+        self.report_type_combo = QComboBox()
+        self.report_type_combo.addItems([
+            "Threat Summary Report", 
+            "Department Risk Analysis", 
+            "Threat Trends Over Time",
+            "Risk Score Distribution",
+            "Email Source Analysis"
+        ])
+        self.report_type_combo.setMinimumWidth(250)
+        self.report_type_combo.setMinimumHeight(30)
+        self.report_type_combo.setStyleSheet("QComboBox { background-color: white; color: black; border: 2px solid #5c9aff; border-radius: 4px; padding: 2px; font-size: 12px; }")
+        form_layout.addRow(report_type_label, self.report_type_combo)
+          # Time period combo
+        time_period_label = QLabel("Time Period:")
+        time_period_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        time_period_label.setStyleSheet("color: #333333; background: transparent;")
+        
+        self.time_period_combo = QComboBox()
+        self.time_period_combo.addItems([
+            "Last 7 Days",
+            "Last 30 Days",
+            "Last Quarter",
+            "Year to Date",
+            "Custom Period"
+        ])
+        self.time_period_combo.setMinimumWidth(250)
+        self.time_period_combo.setMinimumHeight(30)
+        self.time_period_combo.setStyleSheet("QComboBox { background-color: white; color: black; border: 2px solid #5c9aff; border-radius: 4px; padding: 2px; font-size: 12px; }")
+        form_layout.addRow(time_period_label, self.time_period_combo)
+          # Department filter
+        department_label = QLabel("Department:")
+        department_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        department_label.setStyleSheet("color: #333333; background: transparent;")
+        
+        self.dept_filter = QComboBox()
+        self.dept_filter.addItems([
+            "All Departments",
+            "Finance",
+            "Human Resources",
+            "IT",
+            "Marketing",
+            "Sales",
+            "Operations"
+        ])
+        self.dept_filter.setMinimumWidth(250)
+        self.dept_filter.setMinimumHeight(30)
+        self.dept_filter.setStyleSheet("QComboBox { background-color: white; color: black; border: 2px solid #5c9aff; border-radius: 4px; padding: 2px; font-size: 12px; }")
+        form_layout.addRow(department_label, self.dept_filter)
+          # Format combo
+        format_label = QLabel("Format:")
+        format_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        format_label.setStyleSheet("color: #333333; background: transparent;")
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["PDF", "HTML", "CSV", "Excel"])
+        self.format_combo.setMinimumWidth(250)
+        self.format_combo.setMinimumHeight(30)
+        self.format_combo.setStyleSheet("QComboBox { background-color: white; color: black; border: 2px solid #5c9aff; border-radius: 4px; padding: 2px; font-size: 12px; }")
+        form_layout.addRow(format_label, self.format_combo)
+        
+        # Add form to layout
+        report_layout.addLayout(form_layout)
+        
+        # Buttons layout
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(15)
+        buttons_layout.setContentsMargins(0, 25, 0, 0)
+        
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        buttons_layout.addWidget(spacer)
+        
+        preview_button = QPushButton("Preview Report")
+        preview_button.setCursor(Qt.PointingHandCursor)
+        preview_button.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: #333333; background-color: #f0f0f0; "
+            "border: 1px solid #cccccc; border-radius: 4px; padding: 8px 15px; }"
+            "QPushButton:hover { background-color: #e0e0e0; border-color: #5c9aff; }"
+            "QPushButton:pressed { background-color: #d0d0d0; }"
+        )
+        preview_button.setMinimumWidth(120)
+        preview_button.setMinimumHeight(35)
+        preview_button.clicked.connect(self.previewReport)
+        buttons_layout.addWidget(preview_button)
+        
+        generate_button = QPushButton("Generate Report")
+        generate_button.setObjectName("generate_report_button")  # For QSS styling
+        generate_button.setIcon(get_icon("report"))
+        generate_button.setCursor(Qt.PointingHandCursor)
+        generate_button.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: white; background-color: #4361ee; "
+            "border: 1px solid #3f37c9; border-radius: 4px; padding: 8px 15px; }"
+            "QPushButton:hover { background-color: #3f37c9; }"
+            "QPushButton:pressed { background-color: #3730b5; }"
+        )
+        generate_button.setMinimumWidth(150)
+        generate_button.setMinimumHeight(35)
+        generate_button.clicked.connect(self.generateReport)
+        buttons_layout.addWidget(generate_button)
+        
+        report_layout.addLayout(buttons_layout)
+        
+        # Previous reports section
+        previous_frame = QFrame()
+        previous_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 15px; margin-top: 15px;")
+        previous_layout = QVBoxLayout(previous_frame)
+        
+        # Title with count
+        previous_title_layout = QHBoxLayout()
+        previous_title = QLabel("Previous Reports")
+        previous_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        previous_title.setStyleSheet("color: #0066cc; margin-bottom: 5px;")
+        previous_count = QLabel("12 reports available")
+        previous_count.setStyleSheet("color: #666666; font-size: 12px;")
+        
+        previous_title_layout.addWidget(previous_title)
+        previous_title_layout.addStretch()
+        previous_title_layout.addWidget(previous_count)
+        
+        previous_layout.addLayout(previous_title_layout)
+        
+        # Previous reports table
+        reports_table = QTableWidget()
+        reports_table.setColumnCount(5)
+        reports_table.setHorizontalHeaderLabels([
+            "Date Generated", "Report Type", "Period", "Format", "Actions"
+        ])
+        
+        # Configure table appearance
+        reports_table.setAlternatingRowColors(True)
+        reports_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        reports_table.setSelectionBehavior(QTableWidget.SelectRows)
+        reports_table.setStyleSheet(
+            "QTableWidget { border: 1px solid #dddddd; gridline-color: #dddddd; background-color: #ffffff; }"
+            "QTableWidget::item { padding: 5px; }"
+            "QHeaderView::section { background-color: #5c9aff; color: white; padding: 6px; font-weight: bold; }"
+            "QTableWidget::item:selected { background-color: #e0e0ff; color: #000000; }"
+        )
+        reports_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)  # Report Type column stretch
+        reports_table.verticalHeader().setVisible(False)  # Hide row numbers
+        reports_table.setMinimumHeight(200)  # Ensure the table has enough height
+        
+        # Add some example data
+        reports_table.setRowCount(5)
+        
+        # Example report 1
+        reports_table.setItem(0, 0, QTableWidgetItem("2025-05-09"))
+        reports_table.setItem(0, 1, QTableWidgetItem("Threat Summary Report"))
+        reports_table.setItem(0, 2, QTableWidgetItem("Last 7 Days"))
+        reports_table.setItem(0, 3, QTableWidgetItem("PDF"))
+        
+        # Example report 2
+        reports_table.setItem(1, 0, QTableWidgetItem("2025-05-05"))
+        reports_table.setItem(1, 1, QTableWidgetItem("Department Risk Analysis"))
+        reports_table.setItem(1, 2, QTableWidgetItem("Last 30 Days"))
+        reports_table.setItem(1, 3, QTableWidgetItem("HTML"))
+        
+        # Example report 3
+        reports_table.setItem(2, 0, QTableWidgetItem("2025-04-28"))
+        reports_table.setItem(2, 1, QTableWidgetItem("Threat Trends Over Time"))
+        reports_table.setItem(2, 2, QTableWidgetItem("Last Quarter"))
+        reports_table.setItem(2, 3, QTableWidgetItem("PDF"))
+        
+        # Example report 4
+        reports_table.setItem(3, 0, QTableWidgetItem("2025-04-15"))
+        reports_table.setItem(3, 1, QTableWidgetItem("Risk Score Distribution"))
+        reports_table.setItem(3, 2, QTableWidgetItem("Year to Date"))
+        reports_table.setItem(3, 3, QTableWidgetItem("Excel"))
+        
+        # Example report 5
+        reports_table.setItem(4, 0, QTableWidgetItem("2025-04-01"))
+        reports_table.setItem(4, 1, QTableWidgetItem("Email Source Analysis"))
+        reports_table.setItem(4, 2, QTableWidgetItem("Last 30 Days"))
+        reports_table.setItem(4, 3, QTableWidgetItem("CSV"))
+        
+        # Add action buttons to each row
+        for i in range(5):
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(4, 2, 4, 2)
+            action_layout.setSpacing(8)
+            
+            view_btn = QPushButton("View")
+            view_btn.setFixedWidth(60)
+            view_btn.setCursor(Qt.PointingHandCursor)
+            view_btn.setStyleSheet(
+                "QPushButton { font-size: 11px; color: #ffffff; background-color: #5c9aff; "
+                "border: none; border-radius: 3px; padding: 4px 0px; }"
+                "QPushButton:hover { background-color: #4361ee; }"
+                "QPushButton:pressed { background-color: #3f37c9; }"
+            )
+            
+            download_btn = QPushButton("Download")
+            download_btn.setFixedWidth(80)
+            download_btn.setCursor(Qt.PointingHandCursor)
+            download_btn.setStyleSheet(
+                "QPushButton { font-size: 11px; color: #333333; background-color: #f0f0f0; "
+                "border: 1px solid #dddddd; border-radius: 3px; padding: 4px 0px; }"
+                "QPushButton:hover { background-color: #e0e0e0; border-color: #5c9aff; }"
+                "QPushButton:pressed { background-color: #d0d0d0; }"
+            )
+            
+            action_layout.addWidget(view_btn)
+            action_layout.addWidget(download_btn)
+            
+            reports_table.setCellWidget(i, 4, action_widget)
+        
+        previous_layout.addWidget(reports_table)
+        
+        # Add all sections to the main layout
+        reports_layout.addWidget(header_frame)
+        reports_layout.addWidget(report_frame)
+        reports_layout.addWidget(previous_frame)
+    def createSettingsTab(self, parent_widget):
+        """Create the settings tab."""
+        settings_layout = QVBoxLayout(parent_widget)
+        settings_layout.setContentsMargins(15, 15, 15, 15)
+        settings_layout.setSpacing(15)
+        
+        # Header section
+        header_frame = QFrame()
+        header_frame.setStyleSheet(
+            "QFrame {background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6c757d, stop:1 #868e96); "
+            "border-radius: 8px; color: white; padding: 15px;}"
+        )
+        header_frame.setMinimumHeight(100)
+        header_layout = QVBoxLayout(header_frame)
+        
+        header_title = QLabel("Settings")
+        header_title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        header_title.setStyleSheet("color: white;")
+        
+        header_subtitle = QLabel(
+            "Configure PhishGuard settings, email monitoring options, and notification preferences."
+        )
+        header_subtitle.setStyleSheet("color: rgba(255, 255, 255, 0.8);")
+        header_subtitle.setWordWrap(True)
+        
+        header_layout.addWidget(header_title)
+        header_layout.addWidget(header_subtitle)
+        
+        # Email monitoring settings
+        email_settings_frame = QFrame()
+        email_settings_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 15px;")
+        email_settings_layout = QVBoxLayout(email_settings_frame)
+        
+        email_title = QLabel("Email Monitoring Settings")
+        email_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        email_settings_layout.addWidget(email_title)
+        
+        # Form layout for email settings
+        email_form = QFormLayout()
+        email_form.setSpacing(10)
+        email_form.setContentsMargins(10, 10, 10, 10)
+        
+        # Email check interval
+        check_interval = QComboBox()
+        check_interval.addItems(["Every 1 minute", "Every 5 minutes", "Every 10 minutes", "Every 30 minutes", "Every hour"])
+        check_interval.setCurrentIndex(1)  # Default to 5 minutes
+        email_form.addRow("Check Interval:", check_interval)
+        
+        # Email account
+        email_account = QLineEdit("username@example.com")
+        email_form.addRow("Email Account:", email_account)
+        
+        # Email domains to monitor
+        monitored_domains = QLineEdit("company.com, company-subdomain.com")
+        email_form.addRow("Domains to Monitor:", monitored_domains)
+        
+        # Add form to layout
+        email_settings_layout.addLayout(email_form)
+        
+        # Notification settings
+        notification_settings_frame = QFrame()
+        notification_settings_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 15px;")
+        notification_settings_layout = QVBoxLayout(notification_settings_frame)
+        
+        notification_title = QLabel("Notification Settings")
+        notification_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        notification_settings_layout.addWidget(notification_title)
+        
+        # Notification options
+        notification_options = QVBoxLayout()
+        
+        desktop_notify = QCheckBox("Show desktop notifications for high-risk threats")
+        desktop_notify.setChecked(True)
+        
+        email_notify = QCheckBox("Send email notifications to security team")
+        email_notify.setChecked(True)
+        
+        sound_notify = QCheckBox("Play sound alert for critical threats")
+        sound_notify.setChecked(True)
+          # Risk threshold
+        risk_threshold_layout = QHBoxLayout()
+        risk_threshold_layout.addWidget(QLabel("Minimum Risk Threshold for Alerts:"))
+        
+        risk_slider = QSlider(Qt.Horizontal)        
+        risk_slider.setMinimum(0)
+        risk_slider.setMaximum(100)
+        risk_slider.setValue(50)
+        risk_slider.setTickPosition(QSlider.TicksBelow)
+        risk_slider.setTickInterval(10)
+        
+        risk_value = QLabel("50%")
+        
+        risk_threshold_layout.addWidget(risk_slider)
+        risk_threshold_layout.addWidget(risk_value)
+        
+        # Connect slider to label
+        self.connectSliderToLabel(risk_slider, risk_value)
+        
+        # Add options to layout
+        notification_options.addWidget(desktop_notify)
+        notification_options.addWidget(email_notify)
+        notification_options.addWidget(sound_notify)
+        notification_options.addLayout(risk_threshold_layout)
+        
+        notification_settings_layout.addLayout(notification_options)
+        
+        # Advanced settings
+        advanced_settings_frame = QFrame()
+        advanced_settings_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 15px;")
+        advanced_settings_layout = QVBoxLayout(advanced_settings_frame)
+        
+        advanced_title = QLabel("Advanced Settings")
+        advanced_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        advanced_settings_layout.addWidget(advanced_title)
+        
+        # Advanced options
+        advanced_options = QFormLayout()
+        advanced_options.setSpacing(10)
+        
+        data_retention = QComboBox()
+        data_retention.addItems(["30 days", "60 days", "90 days", "180 days", "1 year", "Forever"])
+        advanced_options.addRow("Data Retention Period:", data_retention)
+        
+        log_level = QComboBox()
+        log_level.addItems(["Error", "Warning", "Info", "Debug"])
+        log_level.setCurrentIndex(2)  # Default to Info
+        advanced_options.addRow("Logging Level:", log_level)
+        
+        auto_update = QCheckBox("Check for updates automatically")
+        auto_update.setChecked(True)
+        
+        advanced_options.addRow("", auto_update)
+        
+        advanced_settings_layout.addLayout(advanced_options)
+        
+        # Save button section
+        buttons_layout = QHBoxLayout()
+        
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        buttons_layout.addWidget(spacer)
+        
+        reset_button = QPushButton("Reset to Defaults")
+        reset_button.setCursor(Qt.PointingHandCursor)
+        
+        save_button = QPushButton("Save Settings")
+        save_button.setObjectName("settings_button")  # For QSS styling
+        save_button.setIcon(get_icon("settings"))
+        save_button.setCursor(Qt.PointingHandCursor)
+        
+        buttons_layout.addWidget(reset_button)
+        buttons_layout.addWidget(save_button)
+        
+        # Add all sections to main layout
+        settings_layout.addWidget(header_frame)
+        settings_layout.addWidget(email_settings_frame)
+        settings_layout.addWidget(notification_settings_frame)
+        settings_layout.addWidget(advanced_settings_frame)
+        settings_layout.addLayout(buttons_layout)
+    
+    def connectSignals(self):
+        """Connect signals to slots."""
+        # Connect monitoring buttons
+        self.start_button.clicked.connect(self.startMonitoring)
+        self.stop_button.clicked.connect(self.stopMonitoring)
+    
+    def startMonitoring(self):
+        """Start the email monitoring process."""
+        if not self.monitoring_active:
+            try:
+                # Create and start the monitoring thread
+                self.email_thread = EmailMonitoringThread(self.gmail_monitor, self.threat_detector)
+                self.email_thread.email_received.connect(self.handleEmailReceived)
+                self.email_thread.error_occurred.connect(self.handleThreadError)
+                self.email_thread.status_update.connect(self.updateStatus)
+                self.email_thread.start()
+                
+                # Update UI
+                self.monitoring_active = True
+                self.monitoring_status.setText("Monitoring: Active")
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(True)
+                self.statusBar.showMessage("Email monitoring started")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Monitoring Error", 
+                                    f"Failed to start email monitoring: {str(e)}")
+    
+    def stopMonitoring(self):
+        """Stop the email monitoring process."""
+        if self.monitoring_active and self.email_thread:
+            # Stop the monitoring thread
+            self.email_thread.stop()
+            self.email_thread.wait()
+            self.email_thread = None
+            
+            # Update UI
+            self.monitoring_active = False
+            self.monitoring_status.setText("Monitoring: Inactive")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.statusBar.showMessage("Email monitoring stopped")
+    
+    def handleEmailReceived(self, email_data):
+        """Handle received email data."""
+        try:
+            # Extract relevant information
+            subject = email_data.get('subject', 'No subject')
+            sender = email_data.get('from', 'Unknown sender')
+            is_suspicious = email_data.get('is_suspicious', False)
+            risk_score = email_data.get('risk_score', 0)
+            threat_type = email_data.get('threat_type', 'Unknown')
+            
+            # Log message
+            self.statusBar.showMessage(f"Email received: {subject}")
+            
+            # If suspicious, show alert and log threat
+            if is_suspicious:
+                # Show alert
+                self.warning_system.show_alert(
+                    email_data,
+                    risk_score,
+                    threat_type,
+                    email_data.get('indicators', [])
+                )
+                
+                # Log the threat
+                self.data_logger.log_threat(
+                    email_data,
+                    risk_score,
+                    threat_type,
+                    email_data.get('indicators', [])
+                )
+                
+                # Add to recent threats table
+                self.addThreatToTable(email_data)
+                
+                # Update statistics
+                self.updateStatistics()
+            
+        except Exception as e:
+            logger.error(f"Error handling email: {str(e)}")
+    
+    def handleThreadError(self, error_message):
+        """Handle errors from the monitoring thread."""
+        self.statusBar.showMessage(f"Error: {error_message}")
+        logger.error(error_message)
+    
+    def updateStatus(self, message):
+        """Update status message."""
+        self.statusBar.showMessage(message)
+    
+    def addThreatToTable(self, email_data):
+        """Add a threat to the recent threats table."""
+        try:
+            # Get the current row count
+            row = self.recent_threats_table.rowCount()
+            self.recent_threats_table.insertRow(row)
+            
+            # Get the timestamp
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            
+            # Add data to the table
+            self.recent_threats_table.setItem(row, 0, QTableWidgetItem(timestamp))
+            self.recent_threats_table.setItem(row, 1, QTableWidgetItem(email_data.get('from', '')))
+            self.recent_threats_table.setItem(row, 2, QTableWidgetItem(email_data.get('subject', '')))
+            
+            # Create risk score item with color coding
+            risk_score = email_data.get('risk_score', 0)
+            risk_item = QTableWidgetItem(f"{risk_score:.1f}%")
+            
+            if risk_score >= 80:
+                risk_item.setBackground(QColor(COLORS['danger']))
+                risk_item.setForeground(QColor('white'))
+            elif risk_score >= 60:
+                risk_item.setBackground(QColor(COLORS['warning']))
+            else:
+                risk_item.setBackground(QColor(COLORS['success']))
+                risk_item.setForeground(QColor('white'))
+            
+            self.recent_threats_table.setItem(row, 3, risk_item)
+            
+            # Format the threat type
+            threat_type = email_data.get('threat_type', '').replace('_', ' ').title()
+            self.recent_threats_table.setItem(row, 4, QTableWidgetItem(threat_type))
+            
+            # If table has more than 10 rows, remove the oldest ones
+            while self.recent_threats_table.rowCount() > 10:
+                self.recent_threats_table.removeRow(0)
+            
+        except Exception as e:
+            logger.error(f"Error adding threat to table: {str(e)}")
+    
+    def updateStatistics(self):
+        """Update the statistics displayed in the dashboard."""
+        try:
+            # Get threat statistics from the database
+            total_threats = len(self.data_logger.get_threats())
+            today_threats = len(self.data_logger.get_threats(days=1))
+            
+            # Get all threats for calculating average risk score
+            all_threats = self.data_logger.get_threats()
+            avg_score = 0
+            if all_threats:
+                avg_score = sum(threat['risk_score'] for threat in all_threats) / len(all_threats)
+              # Update the statistics labels
+            self.total_threats_label.setText(str(total_threats))
+            self.todays_threats_label.setText(str(today_threats))
+            self.average_risk_score_label.setText(f"{avg_score:.1f}%")
+            self.emails_monitored_label.setText(str(total_threats + 100))  # Placeholder, add actual count
+            
+            # Update department statistics
+            self.updateDepartmentStats()
+            
+        except Exception as e:
+            logger.error(f"Error updating statistics: {str(e)}")
+    
+    def updateDepartmentStats(self):
+        """Update the department statistics table."""
+        try:
+            # Get department statistics
+            dept_stats = self.data_logger.get_department_stats(days=7)
+            
+            # Clear the table
+            self.dept_table.setRowCount(0)
+            
+            # Add data to the table
+            for dept, stats in dept_stats.items():
+                row = self.dept_table.rowCount()
+                self.dept_table.insertRow(row)
+                
+                self.dept_table.setItem(row, 0, QTableWidgetItem(dept))
+                self.dept_table.setItem(row, 1, QTableWidgetItem(str(stats['threat_count'])))
+                self.dept_table.setItem(row, 2, QTableWidgetItem(f"{stats['avg_risk_score']:.1f}%"))
+                
+                # Get most common threat type (placeholder)
+                self.dept_table.setItem(row, 3, QTableWidgetItem("Phishing Attempt"))
+            
+        except Exception as e:
+            logger.error(f"Error updating department statistics: {str(e)}")
+    
+    def closeEvent(self, event):
+        """Handle window close event."""
+        # Stop monitoring when the window is closed
+        if self.monitoring_active and self.email_thread:
+            self.stopMonitoring()
+        
+        # Close database connections
+        if hasattr(self, 'data_logger'):
+            self.data_logger.close()
+        
+        event.accept()
+
+    def populateThreatsList(self):
+        """Populate the threats list with sample data."""
+        # Sample data for the threats table
+        threats = [
+            {
+                "datetime": "2025-05-10 10:30:45",
+                "sender": "suspicious@example.com",
+                "recipient": "finance@company.com",
+                "subject": "Urgent: Your account has been compromised",
+                "risk_level": "High",
+                "risk_color": COLORS['danger'],
+                "threat_type": "Phishing",
+                "status": "Blocked"
+            },
+            {
+                "datetime": "2025-05-10 09:45:22",
+                "sender": "newsletter@unknown-domain.com",
+                "recipient": "marketing@company.com",
+                "subject": "Important Document Attached",
+                "risk_level": "Medium",
+                "risk_color": COLORS['warning'],
+                "threat_type": "Suspicious Attachment",
+                "status": "Quarantined"
+            },
+            {
+                "datetime": "2025-05-09 16:20:15",
+                "sender": "info@company-portal.net",
+                "recipient": "hr@company.com",
+                "subject": "Update your password now",
+                "risk_level": "Low",
+                "risk_color": COLORS['primary'],
+                "threat_type": "Social Engineering",
+                "status": "Warned"
+            },
+            {
+                "datetime": "2025-05-09 14:05:51",
+                "sender": "paypal-security@mail.tk",
+                "recipient": "accounting@company.com",
+                "subject": "Your payment was processed",
+                "risk_level": "High",
+                "risk_color": COLORS['danger'],
+                "threat_type": "Phishing",
+                "status": "Blocked"
+            },
+            {
+                "datetime": "2025-05-08 11:17:32",
+                "sender": "hr-notification@domain.co",
+                "recipient": "ceo@company.com",
+                "subject": "Salary Adjustment Document",
+                "risk_level": "Medium",
+                "risk_color": COLORS['warning'],
+                "threat_type": "Suspicious Link",
+                "status": "Quarantined"
+            },
+            {
+                "datetime": "2025-05-08 09:30:05",
+                "sender": "drive-share@g00gle.co",
+                "recipient": "support@company.com",
+                "subject": "Shared: Project Documents",
+                "risk_level": "High",
+                "risk_color": COLORS['danger'],
+                "threat_type": "Fake Domain",
+                "status": "Blocked"
+            },
+            {
+                "datetime": "2025-05-07 15:42:18",
+                "sender": "account@amaz0n-security.com",
+                "recipient": "purchasing@company.com",
+                "subject": "Your order has been suspended",
+                "risk_level": "High",
+                "risk_color": COLORS['danger'],
+                "threat_type": "Phishing",
+                "status": "Blocked"
+            }
+        ]
+        
+        # Clear existing items
+        self.threats_table.setRowCount(0)
+        
+        # Add sample data
+        for i, threat in enumerate(threats):
+            self.threats_table.insertRow(i)
+            
+            # Date/Time column
+            date_obj = datetime.strptime(threat["datetime"], "%Y-%m-%d %H:%M:%S")
+            date_str = date_obj.strftime("%Y-%m-%d")
+            time_str = date_obj.strftime("%H:%M")
+            date_item = QTableWidgetItem(f"{date_str}\n{time_str}")
+            date_item.setTextAlignment(Qt.AlignCenter)
+            self.threats_table.setItem(i, 0, date_item)
+            
+            # Sender column
+            self.threats_table.setItem(i, 1, QTableWidgetItem(threat["sender"]))
+            
+            # Recipient column
+            self.threats_table.setItem(i, 2, QTableWidgetItem(threat["recipient"]))
+            
+            # Subject column
+            self.threats_table.setItem(i, 3, QTableWidgetItem(threat["subject"]))
+            
+            # Risk Level column
+            risk_item = QTableWidgetItem(threat["risk_level"])
+            risk_item.setForeground(QColor(threat["risk_color"]))
+            risk_item.setTextAlignment(Qt.AlignCenter)
+            self.threats_table.setItem(i, 4, risk_item)
+            
+            # Threat Type column
+            threat_type_item = QTableWidgetItem(threat["threat_type"])
+            threat_type_item.setTextAlignment(Qt.AlignCenter)
+            self.threats_table.setItem(i, 5, threat_type_item)
+            
+            # Status column
+            status_item = QTableWidgetItem(threat["status"])
+            if threat["status"] == "Blocked":
+                status_item.setForeground(QColor(COLORS['danger']))
+            elif threat["status"] == "Quarantined":
+                status_item.setForeground(QColor(COLORS['warning']))
+            else:
+                status_item.setForeground(QColor(COLORS['primary']))
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.threats_table.setItem(i, 6, status_item)
+
+    def connectSliderToLabel(self, slider, label):
+        """Connect a slider to a label to update the label text."""
+        def update_label(value):
+            label.setText(f"{value}%")
+        
+        slider.valueChanged.connect(update_label)
+
+    def previewReport(self):
+        """Preview the report with the selected options."""
+        try:
+            # Get values from form inputs
+            report_type = self.report_type_combo.currentText()
+            time_period = self.time_period_combo.currentText()
+            department = self.dept_filter.currentText()
+            format_type = self.format_combo.currentText()
+            
+            # Create a preview dialog
+            preview_dialog = QDialog(self)
+            preview_dialog.setWindowTitle(f"Preview: {report_type}")
+            preview_dialog.setMinimumSize(800, 600)
+            
+            # Dialog layout
+            dialog_layout = QVBoxLayout(preview_dialog)
+            
+            # Header with report info
+            info_frame = QFrame()
+            info_frame.setStyleSheet(
+                "background-color: #f0f4ff; border-radius: 8px; padding: 15px;"
+            )
+            info_layout = QVBoxLayout(info_frame)
+            
+            # Report title
+            title_label = QLabel(report_type)
+            title_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
+            info_layout.addWidget(title_label)
+            
+            # Report details
+            details_text = f"Time Period: {time_period} | Department: {department} | Format: {format_type}"
+            details_label = QLabel(details_text)
+            details_label.setFont(QFont("Segoe UI", 10))
+            info_layout.addWidget(details_label)
+            
+            date_label = QLabel(f"Report Date: {datetime.now().strftime('%Y-%m-%d')}")
+            date_label.setFont(QFont("Segoe UI", 10))
+            info_layout.addWidget(date_label)
+            
+            # Add info frame to dialog
+            dialog_layout.addWidget(info_frame)
+            
+            # Create a preview of the report content based on type
+            content_frame = QFrame()
+            content_frame.setStyleSheet("background-color: white; border-radius: 8px; padding: 15px;")
+            content_layout = QVBoxLayout(content_frame)
+            
+            if report_type == "Threat Summary Report":
+                self.createThreatSummaryPreview(content_layout)
+            elif report_type == "Department Risk Analysis":
+                self.createDepartmentRiskPreview(content_layout)
+            elif report_type == "Threat Trends Over Time":
+                self.createTrendPreview(content_layout)
+            elif report_type == "Risk Score Distribution":
+                self.createRiskDistributionPreview(content_layout)
+            elif report_type == "Email Source Analysis":
+                self.createSourceAnalysisPreview(content_layout)
+            
+            # Add content frame to dialog
+            dialog_layout.addWidget(content_frame)
+            
+            # Button to close the preview
+            close_button = QPushButton("Close Preview")
+            close_button.clicked.connect(preview_dialog.accept)
+            dialog_layout.addWidget(close_button)
+            
+            # Show the dialog
+            preview_dialog.exec_()
+            
+        except Exception as e:
+            logger.error(f"Error previewing report: {str(e)}")
+            QMessageBox.warning(self, "Preview Error", f"Could not preview report: {str(e)}")
+    
+    def createThreatSummaryPreview(self, parent_layout):
+        """Create a preview of a threat summary report."""
+        # Title
+        section_title = QLabel("Threat Summary")
+        section_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        parent_layout.addWidget(section_title)
+        
+        # Statistics section
+        stats_frame = QFrame()
+        stats_frame.setStyleSheet("background-color: #f8f9fa; border-radius: 8px; padding: 10px;")
+        stats_layout = QHBoxLayout(stats_frame)
+        
+        # Create stat boxes
+        self.createStatBox(stats_layout, "Total Threats", "27", COLORS['primary'])
+        self.createStatBox(stats_layout, "High Risk", "8", COLORS['danger'])
+        self.createStatBox(stats_layout, "Medium Risk", "12", COLORS['warning'])
+        self.createStatBox(stats_layout, "Low Risk", "7", COLORS['success'])
+        
+        parent_layout.addWidget(stats_frame)
+        
+        # Threats table
+        table_title = QLabel("Recent Threats")
+        table_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        parent_layout.addWidget(table_title)
+        
+        threats_table = QTableWidget()
+        threats_table.setColumnCount(5)
+        threats_table.setHorizontalHeaderLabels(["Date", "Sender", "Subject", "Risk Score", "Threat Type"])
+        threats_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)  # Subject column stretch
+        
+        # Add sample data
+        sample_data = [
+            ["2025-05-10", "suspicious@example.com", "Urgent: Your account has been compromised", "85%", "Phishing"],
+            ["2025-05-10", "newsletter@unknown-domain.com", "Important Document Attached", "65%", "Suspicious Attachment"],
+            ["2025-05-09", "info@company-portal.net", "Update your password now", "40%", "Social Engineering"],
+            ["2025-05-09", "paypal-security@mail.tk", "Your payment was processed", "90%", "Phishing"],
+            ["2025-05-08", "hr-notification@domain.co", "Salary Adjustment Document", "55%", "Suspicious Link"]
+        ]
+        
+        threats_table.setRowCount(len(sample_data))
+        
+        for i, row in enumerate(sample_data):
+            threats_table.setItem(i, 0, QTableWidgetItem(row[0]))
+            threats_table.setItem(i, 1, QTableWidgetItem(row[1]))
+            threats_table.setItem(i, 2, QTableWidgetItem(row[2]))
+            
+            risk_score = QTableWidgetItem(row[3])
+            score_value = int(row[3].replace("%", ""))
+            if score_value >= 80:
+                risk_score.setForeground(QColor(COLORS['danger']))
+            elif score_value >= 50:
+                risk_score.setForeground(QColor(COLORS['warning']))
+            else:
+                risk_score.setForeground(QColor(COLORS['success']))
+            threats_table.setItem(i, 3, risk_score)
+            
+            threats_table.setItem(i, 4, QTableWidgetItem(row[4]))
+        
+        threats_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        threats_table.setAlternatingRowColors(True)
+        parent_layout.addWidget(threats_table)
+    
+    def createDepartmentRiskPreview(self, parent_layout):
+        """Create a preview of a department risk analysis report."""
+        # Title
+        section_title = QLabel("Department Risk Analysis")
+        section_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        parent_layout.addWidget(section_title)
+        
+        # Department statistics table
+        dept_table = QTableWidget()
+        dept_table.setColumnCount(4)
+        dept_table.setHorizontalHeaderLabels(["Department", "Threat Count", "Avg Risk Score", "Most Common Threat"])
+        
+        # Sample department data
+        dept_data = [
+            ["Finance", "12", "78%", "Phishing"],
+            ["Human Resources", "8", "62%", "Social Engineering"],
+            ["IT", "4", "45%", "Malware"],
+            ["Marketing", "7", "58%", "Suspicious Links"],
+            ["Sales", "6", "67%", "Phishing"],
+            ["Operations", "5", "52%", "Suspicious Attachments"]
+        ]
+        
+        dept_table.setRowCount(len(dept_data))
+        
+        for i, row in enumerate(dept_data):
+            dept_table.setItem(i, 0, QTableWidgetItem(row[0]))
+            dept_table.setItem(i, 1, QTableWidgetItem(row[1]))
+            
+            risk_score = QTableWidgetItem(row[2])
+            score_value = int(row[2].replace("%", ""))
+            if score_value >= 70:
+                risk_score.setForeground(QColor(COLORS['danger']))
+            elif score_value >= 50:
+                risk_score.setForeground(QColor(COLORS['warning']))
+            else:
+                risk_score.setForeground(QColor(COLORS['success']))
+            dept_table.setItem(i, 2, risk_score)
+            
+            dept_table.setItem(i, 3, QTableWidgetItem(row[3]))
+        
+        dept_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        dept_table.setAlternatingRowColors(True)
+        dept_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        
+        parent_layout.addWidget(dept_table)
+        
+        # Add a note
+        note_label = QLabel("This report shows risk analysis for each department based on email threats detected in the selected time period.")
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("color: #6c757d; font-style: italic;")
+        parent_layout.addWidget(note_label)
+    
+    def createTrendPreview(self, parent_layout):
+        """Create a preview of a threat trends over time report."""
+        # Title
+        section_title = QLabel("Threat Trends Over Time")
+        section_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        parent_layout.addWidget(section_title)
+        
+        description = QLabel("This report shows the trend of email threats over the selected time period.")
+        description.setWordWrap(True)
+        parent_layout.addWidget(description)
+        
+        # Placeholder for chart (in a real implementation, this would be a matplotlib chart)
+        chart_placeholder = QLabel("[ Chart: Threat trend over time would be displayed here ]")
+        chart_placeholder.setAlignment(Qt.AlignCenter)
+        chart_placeholder.setStyleSheet("background-color: #f8f9fa; padding: 40px; font-style: italic; color: #6c757d;")
+        chart_placeholder.setMinimumHeight(200)
+        parent_layout.addWidget(chart_placeholder)
+        
+        # Trend data table
+        trend_table = QTableWidget()
+        trend_table.setColumnCount(4)
+        trend_table.setHorizontalHeaderLabels(["Date", "Total Threats", "High Risk", "Medium Risk"])
+        
+        # Sample trend data
+        trend_data = [
+            ["2025-05-10", "6", "2", "3"],
+            ["2025-05-09", "8", "3", "4"],
+            ["2025-05-08", "5", "1", "2"],
+            ["2025-05-07", "4", "1", "1"],
+            ["2025-05-06", "7", "2", "3"],
+            ["2025-05-05", "9", "3", "4"],
+            ["2025-05-04", "4", "1", "2"]
+        ]
+        
+        trend_table.setRowCount(len(trend_data))
+        
+        for i, row in enumerate(trend_data):
+            for j, cell in enumerate(row):
+                trend_table.setItem(i, j, QTableWidgetItem(cell))
+        
+        trend_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        trend_table.setAlternatingRowColors(True)
+        
+        parent_layout.addWidget(trend_table)
+    
+    def createRiskDistributionPreview(self, parent_layout):
+        """Create a preview of a risk score distribution report."""
+        # Title
+        section_title = QLabel("Risk Score Distribution")
+        section_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        parent_layout.addWidget(section_title)
+        
+        description = QLabel("This report shows the distribution of risk scores across all detected threats.")
+        description.setWordWrap(True)
+        parent_layout.addWidget(description)
+        
+        # Placeholder for chart
+        chart_placeholder = QLabel("[ Chart: Risk score distribution would be displayed here ]")
+        chart_placeholder.setAlignment(Qt.AlignCenter)
+        chart_placeholder.setStyleSheet("background-color: #f8f9fa; padding: 40px; font-style: italic; color: #6c757d;")
+        chart_placeholder.setMinimumHeight(200)
+        parent_layout.addWidget(chart_placeholder)
+        
+        # Risk distribution table
+        risk_table = QTableWidget()
+        risk_table.setColumnCount(3)
+        risk_table.setHorizontalHeaderLabels(["Risk Level", "Count", "Percentage"])
+        
+        # Sample risk data
+        risk_data = [
+            ["High Risk (80-100%)", "8", "30%"],
+            ["Medium Risk (50-79%)", "12", "44%"],
+            ["Low Risk (0-49%)", "7", "26%"]
+        ]
+        
+        risk_table.setRowCount(len(risk_data))
+        
+        for i, row in enumerate(risk_data):
+            risk_level = QTableWidgetItem(row[0])
+            if i == 0:
+                risk_level.setForeground(QColor(COLORS['danger']))
+            elif i == 1:
+                risk_level.setForeground(QColor(COLORS['warning']))
+            else:
+                risk_level.setForeground(QColor(COLORS['success']))
+            
+            risk_table.setItem(i, 0, risk_level)
+            risk_table.setItem(i, 1, QTableWidgetItem(row[1]))
+            risk_table.setItem(i, 2, QTableWidgetItem(row[2]))
+        
+        risk_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        risk_table.setAlternatingRowColors(True)
+        risk_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        
+        parent_layout.addWidget(risk_table)
+    
+    def createSourceAnalysisPreview(self, parent_layout):
+        """Create a preview of an email source analysis report."""
+        # Title
+        section_title = QLabel("Email Source Analysis")
+        section_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        parent_layout.addWidget(section_title)
+        
+        description = QLabel("This report analyzes the sources of suspicious emails, including domains and geographic regions.")
+        description.setWordWrap(True)
+        parent_layout.addWidget(description)
+        
+        # Placeholder for chart
+        chart_placeholder = QLabel("[ Chart: Email source distribution would be displayed here ]")
+        chart_placeholder.setAlignment(Qt.AlignCenter)
+        chart_placeholder.setStyleSheet("background-color: #f8f9fa; padding: 40px; font-style: italic; color: #6c757d;")
+        chart_placeholder.setMinimumHeight(200)
+        parent_layout.addWidget(chart_placeholder)
+        
+        # Source analysis table
+        source_table = QTableWidget()
+        source_table.setColumnCount(3)
+        source_table.setHorizontalHeaderLabels(["Domain/Source", "Threat Count", "Common Threat Type"])
+        
+        # Sample source data
+        source_data = [
+            ["mail.suspicious-domain.com", "5", "Phishing"],
+            ["newsletter-service.co", "3", "Suspicious Links"],
+            ["secure-alerts.net", "4", "Social Engineering"],
+            ["account-verify.info", "3", "Phishing"],
+            ["docshare.xyz", "2", "Malware"],
+            ["Other Sources", "10", "Various"]
+        ]
+        
+        source_table.setRowCount(len(source_data))
+        
+        for i, row in enumerate(source_data):
+            for j, cell in enumerate(row):
+                source_table.setItem(i, j, QTableWidgetItem(cell))
+        
+        source_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        source_table.setAlternatingRowColors(True)
+        source_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        
+        parent_layout.addWidget(source_table)
+    
+    def createStatBox(self, parent_layout, title, value, color):
+        """Create a statistic box for the report preview."""
+        stat_frame = QFrame()
+        stat_frame.setStyleSheet(f"background-color: white; border-radius: 8px; border: 1px solid {color};")
+        stat_layout = QVBoxLayout(stat_frame)
+        
+        # Title
+        title_label = QLabel(title)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: #6c757d;")
+          # Value
+        value_label = QLabel(value)
+        value_label.setAlignment(Qt.AlignCenter)
+        value_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        value_label.setStyleSheet(f"color: {color};")
+        
+        stat_layout.addWidget(title_label)
+        stat_layout.addWidget(value_label)
+        
+        parent_layout.addWidget(stat_frame)
+    
+    def generateReport(self):
+        """Generate a report with the selected options."""
+        try:
+            # Get values from form inputs
+            report_type = self.report_type_combo.currentText()
+            time_period = self.time_period_combo.currentText()
+            department = self.dept_filter.currentText()
+            format_type = self.format_combo.currentText()
+            
+            # Show generating message
+            self.statusBar.showMessage(f"Generating {report_type}...")
+            
+            # Generate timestamp for the filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename_base = f"{report_type.replace(' ', '_')}_{department.replace(' ', '_')}_{timestamp}"
+            
+            # Determine file extension based on format type
+            extensions = {
+                "PDF": ".pdf",
+                "HTML": ".html",
+                "CSV": ".csv",
+                "Excel": ".xlsx"
+            }
+            extension = extensions.get(format_type, ".pdf")
+            
+            # In a real implementation, this would use the ReportGenerator to create the actual report
+            # Default save path (can be changed by user in the save dialog)
+            default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+            os.makedirs(default_path, exist_ok=True)
+            
+            # For each format, define the subdirectory
+            format_dirs = {
+                "PDF": "pdf",
+                "HTML": "html",
+                "CSV": "csv",
+                "Excel": "excel"
+            }
+            
+            format_dir = format_dirs.get(format_type, "")
+            if format_dir:
+                default_path = os.path.join(default_path, format_dir)
+                os.makedirs(default_path, exist_ok=True)
+            
+            default_file = os.path.join(default_path, filename_base + extension)
+            
+            # Open a file save dialog for the user to choose where to save the report
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Report",
+                default_file,
+                f"{format_type} Files (*{extension});;All Files (*)"
+            )
+            
+            if not file_path:
+                # User canceled the save dialog
+                self.statusBar.showMessage("Report generation canceled", 5000)
+                return
+            
+            # Create a simulated file for demonstration purposes
+            # In a real implementation, this would generate the actual report
+            try:
+                if format_type == "HTML":
+                    self.createDemoHtmlReport(file_path, report_type, time_period, department)
+                elif format_type == "CSV":
+                    self.createDemoCsvReport(file_path, report_type, time_period, department)
+                elif format_type == "Excel":
+                    self.createDemoExcelReport(file_path, report_type, time_period, department)
+                else:  # Default to PDF
+                    self.createDemoPdfReport(file_path, report_type, time_period, department)
+                
+                # Show success message with option to open the file
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("Report Generated")
+                msg_box.setText(f"The {report_type} has been generated in {format_type} format and saved to:\n{file_path}")
+                msg_box.setIcon(QMessageBox.Information)
+                
+                # Add buttons to open file or view containing folder
+                open_btn = msg_box.addButton("Open Report", QMessageBox.ActionRole)
+                open_folder_btn = msg_box.addButton("Open Folder", QMessageBox.ActionRole)
+                close_btn = msg_box.addButton(QMessageBox.Close)
+                
+                msg_box.exec_()
+                
+                # Handle button clicks
+                if msg_box.clickedButton() == open_btn:
+                    # Open the file with the default application
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+                elif msg_box.clickedButton() == open_folder_btn:
+                    # Open the containing folder
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(file_path)))
+                
+                self.statusBar.showMessage(f"Report generated successfully and saved to {file_path}", 5000)
+                
+            except Exception as e:
+                logger.error(f"Error saving report file: {str(e)}")
+                QMessageBox.warning(self, "Save Error", f"Could not save report file: {str(e)}")
+                self.statusBar.showMessage("Error saving report file", 5000)
+            
+        except Exception as e:
+            logger.error(f"Error generating report: {str(e)}")
+            QMessageBox.warning(self, "Generation Error", f"Could not generate report: {str(e)}")
+            self.statusBar.showMessage("Error generating report", 5000)
+    
+    def createDemoHtmlReport(self, file_path, report_type, time_period, department):
+        """Create a demo HTML report for demonstration purposes."""
+        with open(file_path, 'w', encoding='utf-8') as f:
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{report_type} - PhishGuard</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }}
+        .header {{
+            background-color: #0066cc;
+            color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+        }}
+        h1, h2, h3 {{
+            margin-top: 0;
+            color: #343a40;
+        }}
+        .header h1 {{
+            color: white;
+            margin: 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }}
+        th, td {{
+            border: 1px solid #ddd;
+            padding: 8px 12px;
+            text-align: left;
+        }}
+        th {{
+            background-color: #5c9aff;
+            color: white;
+        }}
+        tr:nth-child(even) {{
+            background-color: #f9f9f9;
+        }}
+        .footer {{
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+            text-align: center;
+            font-size: 0.9em;
+            color: #666;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>{report_type}</h1>
+            <p>Time Period: {time_period} | Department: {department}</p>
+            <p>Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+        </div>
+        
+        <h2>Report Content</h2>
+        <p>This is a demo report. In a real implementation, this would contain actual data.</p>
+        
+        <div class="footer">
+            <p>This report was automatically generated by PhishGuard.</p>
+            <p>If you have questions about this report, please contact your IT department.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+            f.write(html_content)
+    
+    def createDemoCsvReport(self, file_path, report_type, time_period, department):
+        """Create a demo CSV report for demonstration purposes."""
+        import csv
+        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # Write header row with metadata
+            writer.writerow([f"{report_type} - PhishGuard"])
+            writer.writerow([f"Time Period: {time_period}"])
+            writer.writerow([f"Department: {department}"])
+            writer.writerow([f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+            writer.writerow([])  # Empty row for spacing
+            
+            # Write data headers
+            if "Threat Summary" in report_type:
+                writer.writerow(["Date", "Sender", "Subject", "Risk Score", "Threat Type"])
+                # Sample data
+                writer.writerow(["2025-05-10", "suspicious@example.com", "Urgent: Your account has been compromised", "85%", "Phishing"])
+                writer.writerow(["2025-05-10", "newsletter@unknown-domain.com", "Important Document Attached", "65%", "Suspicious Attachment"])
+                writer.writerow(["2025-05-09", "info@company-portal.net", "Update your password now", "40%", "Social Engineering"])
+            elif "Department Risk" in report_type:
+                writer.writerow(["Department", "Threat Count", "Avg Risk Score", "Most Common Threat"])
+                # Sample data
+                writer.writerow(["Finance", "12", "78%", "Phishing"])
+                writer.writerow(["Human Resources", "8", "62%", "Social Engineering"])
+                writer.writerow(["IT", "4", "45%", "Malware"])
+            else:
+                # Generic headers for other report types                writer.writerow(["Category", "Value", "Details"])
+                writer.writerow(["Sample 1", "Value 1", "Detail info"])
+                writer.writerow(["Sample 2", "Value 2", "Detail info"])
+    
+    def createDemoExcelReport(self, file_path, report_type, time_period, department):
+        """Create a demo Excel report for demonstration purposes."""
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        
+        # Create a new workbook and select the active worksheet
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Report"
+        
+        # Define styles
+        header_font = Font(name='Calibri', bold=True, size=12, color='FFFFFF')
+        header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+        title_font = Font(name='Calibri', bold=True, size=14)
+        info_font = Font(name='Calibri', italic=True, size=10)
+        normal_font = Font(name='Calibri', size=11)
+        border = Border(
+            left=Side(style='thin'), 
+            right=Side(style='thin'), 
+            top=Side(style='thin'), 
+            bottom=Side(style='thin')
+        )
+        center_align = Alignment(horizontal='center')
+        
+        # Add title
+        worksheet['A1'] = report_type
+        worksheet['A1'].font = title_font
+        
+        # Add metadata
+        worksheet['A2'] = f"Time Period: {time_period}"
+        worksheet['A2'].font = info_font
+        worksheet['A3'] = f"Department: {department}"
+        worksheet['A3'].font = info_font
+        worksheet['A4'] = f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        worksheet['A4'].font = info_font
+        
+        # Add report content based on report type
+        start_row = 6
+        
+        if "Threat Summary" in report_type:
+            # Add headers
+            headers = ["Date", "Sender", "Subject", "Risk Score", "Threat Type"]
+            for col_num, header in enumerate(headers, 1):
+                cell = worksheet.cell(row=start_row, column=col_num, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_align
+                cell.border = border
+                
+            # Add data
+            data = [
+                ["2025-05-10", "suspicious@example.com", "Urgent: Your account has been compromised", "85%", "Phishing"],
+                ["2025-05-10", "newsletter@unknown-domain.com", "Important Document Attached", "65%", "Suspicious Attachment"],
+                ["2025-05-09", "info@company-portal.net", "Update your password now", "40%", "Social Engineering"]
+            ]
+            
+            for row_num, row_data in enumerate(data, start_row + 1):
+                for col_num, cell_value in enumerate(row_data, 1):
+                    cell = worksheet.cell(row=row_num, column=col_num, value=cell_value)
+                    cell.font = normal_font
+                    cell.border = border
+                    if col_num == 4:  # Risk Score column
+                        cell.alignment = center_align
+                    
+        elif "Department Risk" in report_type:
+            # Add headers
+            headers = ["Department", "Threat Count", "Avg Risk Score", "Most Common Threat"]
+            for col_num, header in enumerate(headers, 1):
+                cell = worksheet.cell(row=start_row, column=col_num, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_align
+                cell.border = border
+                
+            # Add data
+            data = [
+                ["Finance", "12", "78%", "Phishing"],
+                ["Human Resources", "8", "62%", "Social Engineering"],
+                ["IT", "4", "45%", "Malware"],
+                ["Marketing", "7", "58%", "Suspicious Links"],
+                ["Sales", "6", "67%", "Phishing"],
+                ["Operations", "5", "52%", "Suspicious Attachments"]
+            ]
+            
+            for row_num, row_data in enumerate(data, start_row + 1):
+                for col_num, cell_value in enumerate(row_data, 1):
+                    cell = worksheet.cell(row=row_num, column=col_num, value=cell_value)
+                    cell.font = normal_font
+                    cell.border = border
+                    if col_num in (2, 3):  # Numeric columns
+                        cell.alignment = center_align
+        
+        else:
+            # Generic content
+            worksheet.cell(row=start_row, column=1, value="Report Content")
+            worksheet.cell(row=start_row, column=1).font = title_font
+            worksheet.cell(row=start_row+1, column=1, value="This is a demo report. In a real implementation, this would contain actual data.")
+            worksheet.cell(row=start_row+1, column=1).font = normal_font
+        
+        # Add footer
+        footer_row = start_row + 10
+        worksheet.cell(row=footer_row, column=1, value="This report was automatically generated by PhishGuard.")
+        worksheet.cell(row=footer_row, column=1).font = info_font
+        worksheet.cell(row=footer_row+1, column=1, value="If you have questions about this report, please contact your IT department.")
+        worksheet.cell(row=footer_row+1, column=1).font = info_font
+        
+        # Auto-adjust column widths
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = openpyxl.utils.get_column_letter(column[0].column)
+            for cell in column:
+                if cell.value:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+            adjusted_width = (max_length + 2) * 1.2
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+          # Save the workbook
+        workbook.save(file_path)
+    
+    def createDemoPdfReport(self, file_path, report_type, time_period, department):
+        """Create a demo PDF report for demonstration purposes."""
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        
+        # Create the PDF document
+        doc = SimpleDocTemplate(file_path, pagesize=letter)
+        
+        # Define styles
+        styles = getSampleStyleSheet()
+        title_style = styles['Title']
+        heading_style = styles['Heading1']
+        normal_style = styles['Normal']
+        
+        # Create custom styles
+        subtitle_style = ParagraphStyle(
+            'Subtitle',
+            parent=styles['Heading2'],
+            textColor=colors.navy,
+            spaceAfter=12
+        )
+        
+        info_style = ParagraphStyle(
+            'Info',
+            parent=styles['Normal'],
+            fontSize=10,
+            textColor=colors.darkblue
+        )
+        
+        # Create the content elements
+        content = []
+        
+        # Add title
+        content.append(Paragraph(report_type, title_style))
+        content.append(Spacer(1, 0.25*inch))
+        
+        # Add report info
+        content.append(Paragraph(f"Time Period: {time_period}", info_style))
+        content.append(Paragraph(f"Department: {department}", info_style))
+        content.append(Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", info_style))
+        content.append(Spacer(1, 0.5*inch))
+        
+        # Add report content based on type
+        if "Threat Summary" in report_type:
+            content.append(Paragraph("Threat Summary", heading_style))
+            content.append(Spacer(1, 0.25*inch))
+            content.append(Paragraph("Recent threats detected in your organization", normal_style))
+            content.append(Spacer(1, 0.25*inch))
+            
+            # Create table data
+            data = [
+                ["Date", "Sender", "Subject", "Risk Score", "Threat Type"],
+                ["2025-05-10", "suspicious@example.com", "Urgent: Your account has been compromised", "85%", "Phishing"],
+                ["2025-05-10", "newsletter@unknown-domain.com", "Important Document Attached", "65%", "Suspicious Attachment"],
+                ["2025-05-09", "info@company-portal.net", "Update your password now", "40%", "Social Engineering"]
+            ]
+            
+            # Create table
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            content.append(table)
+            
+        elif "Department Risk" in report_type:
+            content.append(Paragraph("Department Risk Analysis", heading_style))
+            content.append(Spacer(1, 0.25*inch))
+            content.append(Paragraph("Risk assessment by department", normal_style))
+            content.append(Spacer(1, 0.25*inch))
+            
+            # Create table data
+            data = [
+                ["Department", "Threat Count", "Avg Risk Score", "Most Common Threat"],
+                ["Finance", "12", "78%", "Phishing"],
+                ["Human Resources", "8", "62%", "Social Engineering"],
+                ["IT", "4", "45%", "Malware"],
+                ["Marketing", "7", "58%", "Suspicious Links"],
+                ["Sales", "6", "67%", "Phishing"],
+                ["Operations", "5", "52%", "Suspicious Attachments"]
+            ]
+            
+            # Create table
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            content.append(table)
+            
+        else:
+            content.append(Paragraph("Report Content", heading_style))
+            content.append(Spacer(1, 0.25*inch))
+            content.append(Paragraph("This is a demo report. In a real implementation, this would contain actual data based on the selected report type.", normal_style))
+        
+        content.append(Spacer(1, 0.5*inch))
+        
+        # Add footer
+        content.append(Paragraph("This report was automatically generated by PhishGuard.", info_style))
+        content.append(Paragraph("If you have questions about this report, please contact your IT department.", info_style))
+        
+        # Build the PDF
+        doc.build(content)
+
+if __name__ == "__main__":
+    # Create the application
+    app = QApplication(sys.argv)
+    
+    # Create and show the main window
+    window = PhishGuardGUI()
+    window.show()
+    
+    # Run the application event loop
+    sys.exit(app.exec_())

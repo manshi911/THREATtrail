@@ -1,0 +1,40 @@
+{
+    "departments": [
+        {
+            "id": "79d97dc2-c1ef-445b-8ffb-9b7fc2929345",
+            "name": "IT Department",
+            "email_pattern": "it@|tech@|support@",
+            "contact_person": "IT Manager"
+        },
+        {
+            "id": "c6a5c202-2aea-42f1-b8fe-a2136c856e21",
+            "name": "Finance",
+            "email_pattern": "finance@|accounting@|payroll@",
+            "contact_person": "Finance Director"
+        },
+        {
+            "id": "66796c64-251e-442c-9c1b-a135ee6cab35",
+            "name": "Human Resources",
+            "email_pattern": "hr@|recruitment@|people@",
+            "contact_person": "HR Manager"
+        },
+        {
+            "id": "bbdd775c-57f3-4389-9e5e-e69cf25a75dd",
+            "name": "Executive",
+            "email_pattern": "ceo@|cfo@|cto@|president@|director@",
+            "contact_person": "Executive Assistant"
+        },
+        {
+            "id": "c8f62a9a-334a-492c-a4d1-2cc29fdabe1a",
+            "name": "Sales",
+            "email_pattern": "sales@|marketing@|crm@",
+            "contact_person": "Sales Manager"
+        },
+        {
+            "id": "33c44518-5fb8-4bd8-b7e9-18f005b15123",
+            "name": "Other",
+            "email_pattern": ".*",
+            "contact_person": "IT Support"
+        }
+    ]
+}

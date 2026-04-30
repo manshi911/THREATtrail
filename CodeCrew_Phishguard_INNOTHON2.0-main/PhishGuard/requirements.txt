@@ -1,0 +1,49 @@
+# Email handling
+imaplib2
+email-validator
+secure-smtplib
+
+# AI and ML
+transformers
+scikit-learn
+numpy
+pandas
+
+# OCR and image processing
+pytesseract
+opencv-python
+pillow
+
+# GUI
+tkinter
+PyQt5
+
+# Data storage and reporting
+# sqlite3 is part of the standard library
+openpyxl
+fpdf2
+matplotlib
+
+# Scheduling
+apscheduler
+
+# URL analysis
+requests
+beautifulsoup4
+tldextract
+
+# Utilities
+python-dotenv
+cryptography
+urllib3
+json
+uuid
+re
+logging
+threading
+datetime
+
+# File handling
+pathlib
+io
+tempfile

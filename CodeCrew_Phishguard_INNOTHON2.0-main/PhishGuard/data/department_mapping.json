@@ -1,0 +1,7 @@
+{
+  "Finance": ["finance@company.com", "accounting@company.com", "payroll@company.com"],
+  "HR": ["hr@company.com", "recruiting@company.com", "benefits@company.com"],
+  "IT": ["it@company.com", "support@company.com", "helpdesk@company.com"],
+  "Sales": ["sales@company.com", "marketing@company.com"],
+  "Executive": ["ceo@company.com", "cfo@company.com", "cto@company.com"]
+}
